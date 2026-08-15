@@ -1,18 +1,10 @@
 import { z } from "zod";
-import { TRPCError } from "@trpc/server";
 import { eq, and, gte } from "drizzle-orm";
-import { classes, users, trainerAvailability } from "@/db/schema";
-import { router, protectedProcedure } from "../trpc";
+import { classes, trainerAvailability } from "@/db/schema";
+import { router, trainerProcedure, staffProcedure } from "../trpc";
 
 export const trainersRouter = router({
-  upcomingClasses: protectedProcedure.query(async ({ ctx }) => {
-    if (ctx.user.role !== "trainer") {
-      throw new TRPCError({
-        code: "FORBIDDEN",
-        message: "Only trainers can access this.",
-      });
-    }
-
+  upcomingClasses: trainerProcedure.query(async ({ ctx }) => {
     const now = new Date().toISOString();
 
     return ctx.db
@@ -35,14 +27,7 @@ export const trainersRouter = router({
       .orderBy(classes.startsAt);
   }),
 
-  availability: protectedProcedure.query(async ({ ctx }) => {
-    if (ctx.user.role !== "trainer") {
-      throw new TRPCError({
-        code: "FORBIDDEN",
-        message: "Only trainers can access this.",
-      });
-    }
-
+  availability: trainerProcedure.query(async ({ ctx }) => {
     const rows = await ctx.db
       .select()
       .from(trainerAvailability)
@@ -52,7 +37,7 @@ export const trainersRouter = router({
     return rows;
   }),
 
-  setAvailability: protectedProcedure
+  setAvailability: trainerProcedure
     .input(
       z.object({
         dayOfWeek: z.number().int().min(0).max(6),
@@ -61,13 +46,6 @@ export const trainersRouter = router({
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      if (ctx.user.role !== "trainer") {
-        throw new TRPCError({
-          code: "FORBIDDEN",
-          message: "Only trainers can access this.",
-        });
-      }
-
       const existing = await ctx.db
         .select()
         .from(trainerAvailability)
@@ -103,16 +81,9 @@ export const trainersRouter = router({
       }
     }),
 
-  removeAvailability: protectedProcedure
+  removeAvailability: trainerProcedure
     .input(z.object({ dayOfWeek: z.number().int().min(0).max(6) }))
     .mutation(async ({ ctx, input }) => {
-      if (ctx.user.role !== "trainer") {
-        throw new TRPCError({
-          code: "FORBIDDEN",
-          message: "Only trainers can access this.",
-        });
-      }
-
       const existing = await ctx.db
         .select()
         .from(trainerAvailability)
@@ -133,7 +104,11 @@ export const trainersRouter = router({
       return { success: true };
     }),
 
-  checkAvailability: protectedProcedure
+  // Trainer OR admin — this is exactly what staffProcedure already
+  // checks, so we use it directly instead of duplicating the logic
+  // (previously this had its own manual "trainer or admin" check;
+  // see behavior-inventory.md finding 7).
+  checkAvailability: staffProcedure
     .input(
       z.object({
         trainerId: z.number(),
@@ -142,13 +117,6 @@ export const trainersRouter = router({
       }),
     )
     .query(async ({ ctx, input }) => {
-      // This can be called by staff or trainers
-      if (ctx.user.role !== "trainer" && ctx.user.role !== "admin") {
-        throw new TRPCError({
-          code: "FORBIDDEN",
-          message: "Staff only.",
-        });
-      }
       const classStart = new Date(input.startsAt);
       const classEnd = new Date(classStart.getTime() + input.durationMin * 60000);
 

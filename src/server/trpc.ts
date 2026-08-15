@@ -56,3 +56,17 @@ export const adminProcedure = protectedProcedure.use(({ ctx, next }) => {
   }
   return next({ ctx });
 });
+
+/**
+ * Strictly trainer-only — unlike staffProcedure, admins are NOT let in
+ * here. Added to replace the manual `role !== "trainer"` checks that
+ * used to be duplicated across every handler in trainers.ts — see
+ * behavior-inventory.md finding 7. Message text matches exactly what
+ * those manual checks used to throw, so behavior is unchanged.
+ */
+export const trainerProcedure = protectedProcedure.use(({ ctx, next }) => {
+  if (ctx.user.role !== "trainer") {
+    throw new TRPCError({ code: "FORBIDDEN", message: "Only trainers can access this." });
+  }
+  return next({ ctx });
+});
