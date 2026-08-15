@@ -75,7 +75,20 @@ export const adminRouter = router({
               and ${bookings.status} in ('booked','attended')
           )`.as("booked"),
         })
+        // The leftJoin below isn't for its own columns (none are
+        // selected) — it's required to make Drizzle fully qualify
+        // ${classes.id} as "classes"."id" in the generated SQL above.
+        // Without ANY join, Drizzle renders that reference as a bare
+        // "id", which SQLite then resolves to the closest table in the
+        // correlated subquery — "bookings", which also has its own "id"
+        // column — silently comparing bookings.class_id = bookings.id
+        // instead of bookings.class_id = classes.id. Confirmed by
+        // inspecting query.toSQL() directly; see behavior-inventory.md
+        // finding 14. classes.list has the identical subquery pattern
+        // but happens to already have a real join, which is why it was
+        // never affected by this.
         .from(classes)
+        .leftJoin(users, eq(classes.trainerId, users.id))
         .where(eq(classes.cancelled, false))
         .limit(input.limit);
 
