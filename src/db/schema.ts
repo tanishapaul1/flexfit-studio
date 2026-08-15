@@ -100,6 +100,16 @@ export const checkins = sqliteTable("checkins", {
     .notNull()
     .references(() => users.id),
   bookingId: integer("booking_id").references(() => bookings.id),
+  // Added to fix behavior-inventory.md finding 2: corporate check-ins
+  // previously always left bookingId null with no way to trace them back
+  // to the corporate booking that was checked in, which silently
+  // undercounted attendance in bookings.checkinCountFor (it only joined
+  // on bookingId). A corporate check-in now sets this instead of
+  // bookingId, and checkinCountFor accounts for both — see
+  // booking-core.ts's checkinCountForClass.
+  corporateBookingId: integer("corporate_booking_id").references(
+    () => corporateBookings.id,
+  ),
   checkedInAt: text("checked_in_at")
     .notNull()
     .default(sql`CURRENT_TIMESTAMP`),

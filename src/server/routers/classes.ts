@@ -3,6 +3,7 @@ import { TRPCError } from "@trpc/server";
 import { and, asc, eq, gte, lte, sql } from "drizzle-orm";
 import { classes, bookings, users } from "@/db/schema";
 import { router, publicProcedure, staffProcedure, adminProcedure } from "../trpc";
+import { cancelClassBookings } from "../domain/booking-core";
 
 export const classesRouter = router({
   list: publicProcedure
@@ -143,12 +144,12 @@ export const classesRouter = router({
         throw new TRPCError({ code: "NOT_FOUND", message: "Class not found." });
       }
 
-      await ctx.db
-        .update(bookings)
-        .set({ status: "cancelled", cancelledAt: new Date().toISOString() })
-        .where(
-          and(eq(bookings.classId, input.id), eq(bookings.status, "booked")),
-        );
+      // Refunds booked bookings (personal AND corporate) and cancels
+      // orphaned waitlisted rows — previously this only force-cancelled
+      // personal `booked` rows with no refund and left waitlisted rows
+      // untouched forever. See behavior-inventory.md finding 4 and the
+      // decision recorded in refactor-decisions.md.
+      await cancelClassBookings(ctx.db, { id: cls.id, creditCost: cls.creditCost });
 
       return cls;
     }),
