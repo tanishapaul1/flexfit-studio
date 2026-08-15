@@ -3,19 +3,21 @@ import { TRPCError } from "@trpc/server";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { bookings, classes, memberships, checkins, users } from "@/db/schema";
 import { router, protectedProcedure, staffProcedure } from "../trpc";
+import {
+  UNLIMITED_CREDITS,
+  hoursUntil,
+  isClassFull,
+  chargeCredits,
+  refundCredits,
+  promoteNextWaitlisted,
+  checkinCountForClass,
+} from "../domain/booking-core";
 
 /**
  * Members may cancel free of charge up to this many hours before the class
  * starts. Cancelling later still frees the spot but forfeits the credit.
  */
 export const FREE_CANCELLATION_HOURS = 12;
-
-/** Plans with this many credits are treated as unlimited and never decrement. */
-export const UNLIMITED_CREDITS = 999;
-
-function hoursUntil(iso: string, now = new Date()): number {
-  return (new Date(iso).getTime() - now.getTime()) / 36e5;
-}
 
 async function activeMembershipFor(
   db: typeof import("@/db").db,
@@ -32,7 +34,7 @@ async function activeMembershipFor(
         sql`${memberships.endDate} >= ${today}`,
       ),
     )
-    .orderBy(desc(memberships.endDate))
+    .orderBy(desc(memberships.endDate), desc(memberships.id)) // deterministic tiebreak — see finding 8
     .get();
 }
 
@@ -124,14 +126,9 @@ export const bookingsRouter = router({
         });
       }
 
-      const [{ count }] = await ctx.db
-        .select({ count: sql<number>`count(*)` })
-        .from(bookings)
-        .where(
-          and(eq(bookings.classId, cls.id), eq(bookings.status, "booked")),
-        );
-
-      const isFull = Number(count) >= cls.capacity;
+      // Capacity is now checked across BOTH personal and corporate
+      // bookings combined — see behavior-inventory.md finding 1.
+      const full = await isClassFull(ctx.db, cls.id, cls.capacity);
 
       const created = await ctx.db
         .insert(bookings)
@@ -139,17 +136,18 @@ export const bookingsRouter = router({
           classId: cls.id,
           userId: ctx.user.id,
           membershipId: membership.id,
-          status: isFull ? "waitlisted" : "booked",
-          creditsUsed: isFull ? 0 : cls.creditCost,
+          status: full ? "waitlisted" : "booked",
+          creditsUsed: full ? 0 : cls.creditCost,
         })
         .returning()
         .get();
 
-      if (!isFull && !unlimited) {
-        await ctx.db
-          .update(memberships)
-          .set({ creditsRemaining: membership.creditsRemaining - cls.creditCost })
-          .where(eq(memberships.id, membership.id));
+      if (!full) {
+        await chargeCredits(
+          ctx.db,
+          { kind: "membership", membershipId: membership.id },
+          cls.creditCost,
+        );
       }
 
       return created;
@@ -195,60 +193,21 @@ export const bookingsRouter = router({
         .where(eq(bookings.id, row.booking.id));
 
       if (refundable && row.booking.membershipId) {
-        const ms = await ctx.db
-          .select()
-          .from(memberships)
-          .where(eq(memberships.id, row.booking.membershipId))
-          .get();
-
-        if (ms && ms.creditsRemaining < UNLIMITED_CREDITS) {
-          await ctx.db
-            .update(memberships)
-            .set({ creditsRemaining: ms.creditsRemaining + row.booking.creditsUsed })
-            .where(eq(memberships.id, ms.id));
-        }
+        await refundCredits(
+          ctx.db,
+          { kind: "membership", membershipId: row.booking.membershipId },
+          row.booking.creditsUsed,
+        );
       }
 
-      // Freeing a confirmed spot promotes the member who has waited longest.
+      // Freeing a confirmed spot promotes whoever has waited longest,
+      // considering both personal and corporate waitlists together —
+      // see behavior-inventory.md findings 1 and 5.
       if (row.booking.status === "booked") {
-        const next = await ctx.db
-          .select()
-          .from(bookings)
-          .where(
-            and(
-              eq(bookings.classId, row.cls.id),
-              eq(bookings.status, "waitlisted"),
-            ),
-          )
-          .orderBy(asc(bookings.bookedAt))
-          .get();
-
-        if (next) {
-          await ctx.db
-            .update(bookings)
-            .set({ status: "booked", creditsUsed: row.cls.creditCost })
-            .where(eq(bookings.id, next.id));
-
-          if (next.membershipId) {
-            const ms = await ctx.db
-              .select()
-              .from(memberships)
-              .where(eq(memberships.id, next.membershipId))
-              .get();
-
-            if (ms && ms.creditsRemaining < UNLIMITED_CREDITS) {
-              await ctx.db
-                .update(memberships)
-                .set({
-                  creditsRemaining: Math.max(
-                    0,
-                    ms.creditsRemaining - row.cls.creditCost,
-                  ),
-                })
-                .where(eq(memberships.id, ms.id));
-            }
-          }
-        }
+        await promoteNextWaitlisted(ctx.db, {
+          id: row.cls.id,
+          creditCost: row.cls.creditCost,
+        });
       }
 
       return { ok: true, refunded: refundable };
@@ -347,13 +306,11 @@ export const bookingsRouter = router({
   checkinCountFor: staffProcedure
     .input(z.object({ classId: z.number() }))
     .query(async ({ ctx, input }) => {
-      const [result] = await ctx.db
-        .select({ count: sql<number>`count(*)` })
-        .from(checkins)
-        .innerJoin(bookings, eq(checkins.bookingId, bookings.id))
-        .where(eq(bookings.classId, input.classId));
-
-      return { count: Number(result?.count ?? 0) };
+      // Now counts corporate check-ins too, via the shared helper — see
+      // behavior-inventory.md finding 2. Previously this only joined on
+      // checkins.bookingId, which corporate check-ins never set.
+      const count = await checkinCountForClass(ctx.db, input.classId);
+      return { count };
     }),
 
   waitlisted: protectedProcedure.query(async ({ ctx }) => {
