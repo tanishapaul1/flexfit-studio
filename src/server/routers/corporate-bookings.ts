@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 import {
   corporateBookings,
   classes,
@@ -10,16 +10,19 @@ import {
   users,
 } from "@/db/schema";
 import { router, protectedProcedure, staffProcedure } from "../trpc";
+import {
+  hoursUntil,
+  isClassFull,
+  chargeCredits,
+  refundCredits,
+  promoteNextWaitlisted,
+} from "../domain/booking-core";
 
 /**
  * Corporate members may cancel free of charge up to this many hours before
  * the class starts. Cancelling later still frees the spot but forfeits the credit.
  */
 export const CORPORATE_FREE_CANCELLATION_HOURS = 24;
-
-function hoursUntil(iso: string, now = new Date()): number {
-  return (new Date(iso).getTime() - now.getTime()) / 36e5;
-}
 
 async function getCompanyForMember(
   db: typeof import("@/db").db,
@@ -128,17 +131,11 @@ export const corporateBookingsRouter = router({
         });
       }
 
-      const [{ count }] = await ctx.db
-        .select({ count: sql<number>`count(*)` })
-        .from(corporateBookings)
-        .where(
-          and(
-            eq(corporateBookings.classId, cls.id),
-            eq(corporateBookings.status, "booked"),
-          ),
-        );
-
-      const isFull = Number(count) >= cls.capacity;
+      // Capacity is now checked across BOTH personal and corporate
+      // bookings combined — see behavior-inventory.md finding 1. This
+      // is the actual fix: previously this only counted corporateBookings
+      // rows, allowing a room to be double-booked across both flows.
+      const full = await isClassFull(ctx.db, cls.id, cls.capacity);
 
       const created = await ctx.db
         .insert(corporateBookings)
@@ -146,19 +143,14 @@ export const corporateBookingsRouter = router({
           classId: cls.id,
           userId: ctx.user.id,
           companyId: company.id,
-          status: isFull ? "waitlisted" : "booked",
-          creditsUsed: isFull ? 0 : cls.creditCost,
+          status: full ? "waitlisted" : "booked",
+          creditsUsed: full ? 0 : cls.creditCost,
         })
         .returning()
         .get();
 
-      if (!isFull) {
-        await ctx.db
-          .update(companies)
-          .set({
-            creditPoolBalance: company.creditPoolBalance - cls.creditCost,
-          })
-          .where(eq(companies.id, company.id));
+      if (!full) {
+        await chargeCredits(ctx.db, { kind: "company", companyId: company.id }, cls.creditCost);
       }
 
       return created;
@@ -204,61 +196,25 @@ export const corporateBookingsRouter = router({
         .where(eq(corporateBookings.id, row.booking.id));
 
       if (refundable) {
-        const company = await ctx.db
-          .select()
-          .from(companies)
-          .where(eq(companies.id, row.booking.companyId))
-          .get();
-
-        if (company) {
-          await ctx.db
-            .update(companies)
-            .set({
-              creditPoolBalance:
-                company.creditPoolBalance + row.booking.creditsUsed,
-            })
-            .where(eq(companies.id, company.id));
-        }
+        await refundCredits(
+          ctx.db,
+          { kind: "company", companyId: row.booking.companyId },
+          row.booking.creditsUsed,
+        );
       }
 
-      // Freeing a confirmed spot promotes the member who has waited longest.
+      // Freeing a confirmed spot promotes whoever has waited longest,
+      // considering both personal and corporate waitlists together —
+      // see behavior-inventory.md findings 1 and 5. This also unifies
+      // the credit-deduction policy at promotion time (finding 15):
+      // promotion now always succeeds and floors at 0, rather than
+      // silently skipping the charge when the company's balance was
+      // insufficient, as the old code did.
       if (row.booking.status === "booked") {
-        const next = await ctx.db
-          .select()
-          .from(corporateBookings)
-          .where(
-            and(
-              eq(corporateBookings.classId, row.cls.id),
-              eq(corporateBookings.status, "waitlisted"),
-            ),
-          )
-          .orderBy(asc(corporateBookings.bookedAt))
-          .get();
-
-        if (next) {
-          await ctx.db
-            .update(corporateBookings)
-            .set({ status: "booked", creditsUsed: row.cls.creditCost })
-            .where(eq(corporateBookings.id, next.id));
-
-          const company = await ctx.db
-            .select()
-            .from(companies)
-            .where(eq(companies.id, next.companyId))
-            .get();
-
-          if (company && company.creditPoolBalance >= row.cls.creditCost) {
-            await ctx.db
-              .update(companies)
-              .set({
-                creditPoolBalance: Math.max(
-                  0,
-                  company.creditPoolBalance - row.cls.creditCost,
-                ),
-              })
-              .where(eq(companies.id, company.id));
-          }
-        }
+        await promoteNextWaitlisted(ctx.db, {
+          id: row.cls.id,
+          creditCost: row.cls.creditCost,
+        });
       }
 
       return { ok: true, refunded: refundable };
@@ -295,7 +251,7 @@ export const corporateBookingsRouter = router({
 
       await ctx.db.insert(checkins).values({
         userId: booking.userId,
-        bookingId: null,
+        corporateBookingId: booking.id,
       });
 
       return { ok: true };
