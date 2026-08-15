@@ -53,10 +53,14 @@ export const notificationsRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
+      // Filter by active status too, matching what the variable name
+      // always implied — previously this only filtered by role, so
+      // deactivated accounts silently received broadcasts too. See
+      // behavior-inventory.md finding 9.
       const activeMembers = await ctx.db
         .select({ id: users.id })
         .from(users)
-        .where(eq(users.role, "member"));
+        .where(and(eq(users.role, "member"), eq(users.active, true)));
 
       if (activeMembers.length === 0) {
         return { ok: true, count: 0 };
